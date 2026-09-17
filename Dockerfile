@@ -33,8 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt tetration_frac.py ./
+COPY requirements.txt ./
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirements.txt
-
+COPY tetration_frac.py ./
 CMD ["python3", "tetration_frac.py"]

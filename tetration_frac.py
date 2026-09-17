@@ -13,9 +13,8 @@ fixed base, not per-pixel escape time.
 
 Compute is a fused CUDA ``ElementwiseKernel`` (CuPy). One thread per
 pixel computes ``log(c)`` once, then loops with per-pixel early exit.
-The only host transfer is the smooth escape field (float64). Integer
-iteration for hover / discrete coloring is recovered as
-``floor(smooth)``; interior pixels are stored as ``max_iter``.
+Host transfers are integer escape (interior / hover / Iteration coloring)
+and unclamped smooth bailout (default colormap).
 
 Navigation keeps the last full-resolution image stretched to the new
 view until a debounced GPU recompute finishes.
@@ -28,7 +27,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import cupy as cp
 import matplotlib.pyplot as plt
@@ -50,17 +49,21 @@ _CONVERGENT_IM_EPS = 1e-12
 ColorValueSource = Literal["iteration", "smooth"]
 
 
+class EscapeField(NamedTuple):
+    """Integer escape step plus unclamped continuous bailout index."""
+
+    escape: np.ndarray
+    smooth: np.ndarray
+
+
 def _get_tetration_escape_kernel() -> Any:
     """Return the cached fused CUDA kernel for per-pixel escape iteration.
 
-    Outputs a float64 ``smooth`` value per pixel:
-
-    * escaped: continuous bailout index (integer part is the escape step)
-    * interior / convergent skip: ``max_iter``
-    * ``c == 0``: ``0``
+    Writes integer ``escape`` (step at bailout, or ``max_iter``) and
+    unclamped float64 ``smooth`` for histogram coloring.
 
     Returns:
-        CuPy ElementwiseKernel writing one float64 per linear pixel index.
+        CuPy ElementwiseKernel writing escape and smooth per pixel.
     """
     global _TETRATION_ESCAPE_KERNEL
     if _TETRATION_ESCAPE_KERNEL is None:
@@ -69,7 +72,7 @@ def _get_tetration_escape_kernel() -> Any:
             "int32 width, int32 height, int32 max_iter, float64 escape_radius_sq, "
             "float64 convergent_re_min, float64 convergent_re_max, "
             "float64 convergent_im_eps",
-            "float64 smooth",
+            "int32 escape, float64 smooth",
             r"""
             double log2_val = log(2.0);
             int col = i % width;
@@ -81,12 +84,14 @@ def _get_tetration_escape_kernel() -> Any:
 
             if (fabs(c_im) <= convergent_im_eps
                 && c_re >= convergent_re_min && c_re <= convergent_re_max) {
+                escape = max_iter;
                 smooth = (double)max_iter;
                 return;
             }
 
             double r = sqrt(c_re * c_re + c_im * c_im);
             if (r == 0.0) {
+                escape = 0;
                 smooth = 0.0;
                 return;
             }
@@ -100,13 +105,8 @@ def _get_tetration_escape_kernel() -> Any:
                 double prod_re = z_re * log_c_re - z_im * log_c_im;
                 double prod_im = z_re * log_c_im + z_im * log_c_re;
                 if (prod_re > 700.0) {
+                    escape = step;
                     smooth = (double)step + 1.0 - prod_re / log2_val;
-                    if (smooth < 0.0) {
-                        smooth = 0.0;
-                    }
-                    if (smooth >= (double)max_iter) {
-                        smooth = (double)max_iter - 1e-9;
-                    }
                     return;
                 }
                 double ez = exp(prod_re);
@@ -117,25 +117,22 @@ def _get_tetration_escape_kernel() -> Any:
                 z_im = ez * sin_im;
 
                 if (!isfinite(z_re) || !isfinite(z_im)) {
+                    escape = step;
                     smooth = (double)step + 0.5;
                     return;
                 }
                 double mag_sq = z_re * z_re + z_im * z_im;
                 if (mag_sq > escape_radius_sq) {
+                    escape = step;
                     double mag = sqrt(mag_sq);
                     if (mag < 2.0) {
                         mag = 2.0;
                     }
                     smooth = (double)step + 1.0 - log(log(mag)) / log2_val;
-                    if (smooth < 0.0) {
-                        smooth = 0.0;
-                    }
-                    if (smooth >= (double)max_iter) {
-                        smooth = (double)max_iter - 1e-9;
-                    }
                     return;
                 }
             }
+            escape = max_iter;
             smooth = (double)max_iter;
             """,
             "tetration_escape",
@@ -152,13 +149,13 @@ def compute_escape(
     height: int,
     max_iter: int = 80,
     escape_radius: float = 1e2,
-) -> np.ndarray:
-    """Compute a smooth escape-time field for infinite tetration ``z = c**z``.
+) -> EscapeField:
+    """Compute escape-time fields for infinite tetration ``z = c**z``.
 
     One CUDA launch; no per-iteration host sync. Interior pixels (no
-    bailout within ``max_iter``) receive exactly ``max_iter``. Escaped
-    pixels receive a continuous index whose integer part is the first
-    diverging iteration.
+    bailout within ``max_iter``) receive ``max_iter`` in both channels.
+    Escaped pixels get the integer step plus an unclamped continuous
+    index used for default coloring.
 
     Args:
         x_min: Minimum real coordinate of the view.
@@ -171,11 +168,12 @@ def compute_escape(
         escape_radius: Magnitude threshold for divergence.
 
     Returns:
-        float64 array of shape ``(height, width)`` on the host.
+        EscapeField with int32 escape and float64 smooth arrays.
     """
     kernel = _get_tetration_escape_kernel()
     escape_radius_sq = escape_radius * escape_radius
     size = width * height
+    flat_escape = cp.empty(size, dtype=cp.int32)
     flat_smooth = cp.empty(size, dtype=cp.float64)
     kernel(
         x_min,
@@ -189,25 +187,13 @@ def compute_escape(
         _CONVERGENT_RE_MIN,
         _CONVERGENT_RE_MAX,
         _CONVERGENT_IM_EPS,
+        flat_escape,
         flat_smooth,
     )
-    return cp.asnumpy(flat_smooth.reshape(height, width))
-
-
-def _escape_iterations(smooth: np.ndarray, max_iter: int) -> np.ndarray:
-    """Recover integer escape steps from the smooth field.
-
-    Args:
-        smooth: Smooth escape array from ``compute_escape``.
-        max_iter: Interior sentinel used when computing the field.
-
-    Returns:
-        int32 array; interior pixels remain ``max_iter``.
-    """
-    iterations = np.floor(smooth).astype(np.int32)
-    interior = smooth >= max_iter
-    iterations[interior] = max_iter
-    return iterations
+    return EscapeField(
+        escape=cp.asnumpy(flat_escape.reshape(height, width)),
+        smooth=cp.asnumpy(flat_smooth.reshape(height, width)),
+    )
 
 
 def _escape_to_histogram_normalized(
@@ -260,33 +246,36 @@ def _escape_to_histogram_normalized(
 
 
 def colorize(
-    smooth: np.ndarray,
+    field: EscapeField,
     cmap: str = "turbo",
     max_iter: int | None = None,
     value_source: ColorValueSource = "smooth",
 ) -> np.ndarray:
-    """Apply histogram-equalized colormap to a smooth escape field.
+    """Apply histogram-equalized colormap to escape-time data.
 
-    Interior pixels (``smooth >= max_iter``) are painted black.
+    Interior pixels (``escape >= max_iter``) are painted black. Default
+    coloring uses the unclamped smooth field so nearby bailouts stay a
+    gradient rather than a single band.
 
     Args:
-        smooth: Smooth escape array from ``compute_escape``.
+        field: Integer escape and smooth bailout channels.
         cmap: Matplotlib colormap name.
-        max_iter: Interior sentinel. If None, inferred as ``smooth.max()``.
+        max_iter: Interior sentinel. If None, inferred as ``escape.max()``.
         value_source: Color by continuous bailout or integer iteration.
 
     Returns:
         RGBA float array of shape (height, width, 4).
     """
+    escape = field.escape
     if max_iter is None:
-        max_iter = int(np.max(smooth))
-    escaped_mask = smooth < max_iter
+        max_iter = int(escape.max())
+    escaped_mask = escape < max_iter
 
     if value_source == "smooth":
-        values = smooth
+        values = field.smooth
         integer_histogram = False
     else:
-        values = _escape_iterations(smooth, max_iter).astype(np.float64)
+        values = escape.astype(np.float64)
         integer_histogram = True
 
     normalized = _escape_to_histogram_normalized(
@@ -360,7 +349,7 @@ class TetrationExplorer:
         self._navigation_hooks_installed = False
         self._last_limits: tuple[float, float, float, float] | None = None
         self._recompute_timer: Any = None
-        self._smooth: np.ndarray | None = None
+        self._field: EscapeField | None = None
         self._last_hover_text: str | None = None
         self._base_title = "Infinite tetration escape"
 
@@ -379,7 +368,7 @@ class TetrationExplorer:
         self._fig.subplots_adjust(left=0.04, right=0.99, bottom=0.07, top=0.97)
         self._install_color_controls()
 
-        smooth = compute_escape(
+        field = compute_escape(
             x_min, x_max, y_min, y_max, width, height, max_iter=max_iter
         )
         self._image: AxesImage = self._ax.imshow(
@@ -390,7 +379,7 @@ class TetrationExplorer:
         )
         self._image.sticky_edges.x[:] = []
         self._image.sticky_edges.y[:] = []
-        self._apply_framebuffer(smooth, (x_min, x_max, y_min, y_max))
+        self._apply_framebuffer(field, (x_min, x_max, y_min, y_max))
 
         self._fig.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
         self._fig.canvas.mpl_connect("scroll_event", self._on_scroll)
@@ -521,7 +510,7 @@ class TetrationExplorer:
             limits: View rectangle (x_min, x_max, y_min, y_max).
         """
         x_min, x_max, y_min, y_max = limits
-        smooth = compute_escape(
+        field = compute_escape(
             x_min,
             x_max,
             y_min,
@@ -530,15 +519,15 @@ class TetrationExplorer:
             self._height,
             max_iter=self._max_iter,
         )
-        self._apply_framebuffer(smooth, limits)
+        self._apply_framebuffer(field, limits)
         self._fig.canvas.draw_idle()
 
     def _colorize_current_field(self) -> np.ndarray:
         """Colorize the stored smooth field with current style options."""
-        if self._smooth is None:
+        if self._field is None:
             raise RuntimeError("No escape field is loaded for colorization.")
         return colorize(
-            self._smooth,
+            self._field,
             cmap=self._cmap,
             max_iter=self._max_iter,
             value_source=self._value_source,
@@ -546,16 +535,16 @@ class TetrationExplorer:
 
     def _apply_framebuffer(
         self,
-        smooth: np.ndarray,
+        field: EscapeField,
         limits: tuple[float, float, float, float],
     ) -> None:
-        """Store the smooth field and push a colorized frame to the image.
+        """Store the escape field and push a colorized frame to the image.
 
         Args:
-            smooth: Host float64 escape field.
-            limits: View rectangle matching ``smooth``.
+            field: Integer escape and smooth bailout channels.
+            limits: View rectangle matching ``field``.
         """
-        self._smooth = smooth
+        self._field = field
         self._last_limits = limits
         rgba = self._colorize_current_field()
         x_min, x_max, y_min, y_max = limits
@@ -564,7 +553,7 @@ class TetrationExplorer:
 
     def _recolor_framebuffer(self) -> None:
         """Reapply colormap options without recomputing escape iterations."""
-        if self._smooth is None:
+        if self._field is None:
             return
         self._image.set_data(self._colorize_current_field())
         self._fig.canvas.draw_idle()
@@ -612,7 +601,7 @@ class TetrationExplorer:
         Returns:
             Escape iteration, or None when the field does not match the view.
         """
-        if self._smooth is None or self._last_limits is None:
+        if self._field is None or self._last_limits is None:
             return None
         if not self._field_matches_view():
             return None
@@ -622,16 +611,13 @@ class TetrationExplorer:
         if y < min(y_min, y_max) or y > max(y_min, y_max):
             return None
 
-        width = self._smooth.shape[1]
-        height = self._smooth.shape[0]
+        width = self._field.escape.shape[1]
+        height = self._field.escape.shape[0]
         col = int((x - x_min) / (x_max - x_min) * width)
         row = int((y - y_min) / (y_max - y_min) * height)
         col = int(np.clip(col, 0, width - 1))
         row = int(np.clip(row, 0, height - 1))
-        value = float(self._smooth[row, col])
-        if value >= self._max_iter:
-            return self._max_iter
-        return int(np.floor(value))
+        return int(self._field.escape[row, col])
 
     def _hover_readout_text(
         self,
