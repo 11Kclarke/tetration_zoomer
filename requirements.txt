@@ -1,0 +1,5 @@
+# Matches the working project venv (CUDA 12.x wheel + bundled NVIDIA libs).
+cupy-cuda12x[ctk]==14.2.0
+numpy==2.5.1
+matplotlib==3.11.1
+PyQt5==5.15.11
